@@ -249,7 +249,7 @@ def plot_weight_map_per_layer(weights0, all_layers, prod_wells, inj_wells, prod_
     )
     plt.show()
 
-def show_layers(all_layers, prod_wells_coords, inj_wells_coords):
+def show_layers(all_layers, prod_wells, inj_wells, prod_wells_coords, inj_wells_coords):
     layer_widget = widgets.Dropdown(options=all_layers, index=0, description='Layer:', disabled=False)
     def update(layer):
         fig, ax = plt.subplots(1, 1, figsize=(8, 6))
