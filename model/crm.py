@@ -232,7 +232,7 @@ class CRM:
         self.set_ff_boundaries()
         self.init_ff_weights(ff_weights)
 
-    def set_ff_boundaries(self, bnds_ff_dict={'Empirical': {'a_weights': (0., 50.), 'b_weights': (0.1, 5.)},
+    def set_ff_boundaries(self, bnds_ff_dict={'Empirical': {'a_weights': (0., 50.), 'b_weights': (0., 5.)},
                                               'BL': {'Mo_weights': (0., 5.), 'Vp_weights': (1e-5, 50.),
                                                      'swr_weights': (0., 0.4), 'sor_weights': (0., 0.4),
                                                      'm_weights': (0., 20.), 'n_weights': (0., 5.)}
@@ -270,8 +270,9 @@ class CRM:
         return (1. - 1/(1 + np.exp(oil_frac)))*liquid_rates[1:]
 
     def _frac_empirical(self, t_0, t_n):
-        self.cum_injection = ((self.lambdas_vs_time[t_0+1:t_n+1]*self.injection_rates[t_0+1:t_n+1]*
-                               self.dt[t_0+1:t_n+1, None, None]*self.timestamp).cumsum(0).sum(1)
+        self.cum_injection = ((self.lambdas_vs_time[self.t_0+1:]*self.injection_rates[self.t_0+1:]*
+                               self.dt[self.t_0+1:, None, None]*
+                               self.timestamp).cumsum(0).sum(1)[t_0-self.t_0:t_n-self.t_0]
                              )
         return self.b_weights*np.log(self.cum_injection) - self.a_weights
 
@@ -313,11 +314,14 @@ class CRM:
                 x0_weights = np.hstack((x0_weights, self.ff_weights))
                 bnds = np.vstack((bnds, self.ff_bnds))
                 jac_sparsity = self.jac_sparsity[:, :len(x0_weights)]
-                jac_sparsity = np.vstack((jac_sparsity[1:], jac_sparsity[1:]))
+                jac_sparsity_oil = self.jac_sparsity[[0], :len(x0_weights)]
+                jac_sparsity_oil = jac_sparsity_oil.repeat(self.prod_num*(self.t_n_oil-self.t_0_oil), 0)
+                jac_sparsity = np.vstack((jac_sparsity, jac_sparsity_oil))
         else:
             x0_weights = self.ff_weights
             bnds = self.ff_bnds
-            jac_sparsity = self.jac_sparsity[1:, -len(x0_weights):]
+            jac_sparsity = self.jac_sparsity[[0], -len(x0_weights):].repeat(
+                self.prod_num*(self.t_n_oil-self.t_0_oil), 0)
         if not constraints:
             bnds = None
         return x0_weights, bnds, jac_sparsity
@@ -343,9 +347,11 @@ class CRM:
     def loss_oil(self, params, loss_fn):
         self.init_ff_weights(params[-len(self.ff_weights):])
         oil_frac_preds = self.frac_flow_model(self.t_0_oil, self.t_n_oil)
+        targets = self.liquid_rates[self.t_0_oil+1:self.t_n_oil+1]/self.oil_rates[self.t_0_oil+1:self.t_n_oil+1]
+        targets[np.isnan(targets)] = 2.
         if self.ffm_type == 'Empirical':
-            return loss_fn(self.liquid_rates[self.t_0_oil+1:self.t_n_oil+1]/(1+np.exp(oil_frac_preds)),
-                           self.oil_rates[self.t_0_oil+1:self.t_n_oil+1])
+            return loss_fn((1.-self.shut_mask[self.t_0_oil+1:self.t_n_oil+1])*oil_frac_preds,
+                           np.log(targets-1.))
         elif self.ffm_type == 'BL':
             return loss_fn(oil_frac_preds[1:]*self.liquid_rates[self.t_0_oil:self.t_n_oil+1],
                            self.oil_rates[self.t_0_oil:self.t_n_oil+1])
@@ -359,15 +365,17 @@ class CRM:
     def residuals_oil(self, params):
         self.init_ff_weights(params[-len(self.ff_weights):])
         oil_frac_preds = self.frac_flow_model(self.t_0_oil, self.t_n_oil)
+        targets = self.liquid_rates[self.t_0_oil+1:self.t_n_oil+1]/self.oil_rates[self.t_0_oil+1:self.t_n_oil+1]
+        targets[np.isnan(targets)] = 2.
         if self.ffm_type == 'Empirical':
-            return (self.liquid_rates[self.t_0_oil+1:self.t_n_oil+1]/(np.exp(oil_frac_preds) + 1) -
-                    self.oil_rates[self.t_0_oil+1:self.t_n_oil+1]).flatten()
+            return (np.log(targets-1.) - (1.-self.shut_mask[self.t_0_oil+1:self.t_n_oil+1])*
+                    oil_frac_preds).flatten()
         elif self.ffm_type == 'BL':
             return (oil_frac_preds[1:]*self.liquid_rates[self.t_0_oil:self.t_n_oil+1] -
                     self.oil_rates[self.t_0_oil:self.t_n_oil+1]).flatten()
 
     def optimize(self, opt_type='LSq', loss_type='MAE', fluids='liq',
-                 constraints=True, train_frame=None):
+                 constraints=True, train_frame=None, x0_weights=None):
         if train_frame is not None:
             t_0, t_n = train_frame
             self.reset_train_frame(t_0, t_n)
@@ -405,7 +413,10 @@ class CRM:
                 self.loss_error.append(loss_fn(outp, 0.))
                 return outp
 
-        x0_weights, bnds, jac_sparsity = self.define_bounds(fluids, constraints)
+        if x0_weights is not None:
+            _, bnds, jac_sparsity = self.define_bounds(fluids, constraints)
+        else:
+            x0_weights, bnds, jac_sparsity = self.define_bounds(fluids, constraints)
 
         if opt_type in ['Nelder-Mead', 'BFGS']:
             result = scipy.optimize.minimize(loss, x0_weights, method=opt_type)
@@ -421,7 +432,7 @@ class CRM:
             if constraints:
                 bnds = (bnds[:, 0], bnds[:, 1])
             result = scipy.optimize.least_squares(residuals, x0=x0_weights, bounds=bnds,
-#                                                   jac_sparsity=jac_sparsity,
+                                                  jac_sparsity=jac_sparsity,
                                                   ftol=1e-06, xtol=1e-06, gtol=1e-06) #, x_scale='jac')
 #         if opt_type == 'root':
 #             result = scipy.optimize.root(residuals, x0_weights, method='hybr')
